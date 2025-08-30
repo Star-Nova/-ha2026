@@ -738,7 +738,7 @@ class VideoThread(threading.Thread):
 class AppGUI:
     def __init__(self):
         self.root = ctk.CTk()
-        self.root.title("İHA ALL-IN-ONE v4")
+        self.root.title("Sultanbeyli Nexus Core v4")
         self.root.geometry("1280x800")
         self.root.minsize(1100, 700)
 
@@ -1090,7 +1090,7 @@ class AppGUI:
 # ================== CLI ==================
 def run_cli():
     import argparse
-    p = argparse.ArgumentParser(description="İHA ALL-IN-ONE v4")
+    p = argparse.ArgumentParser(description="Sultanbeyli Nexus Core v4")
     p.add_argument("--source", type=str, default="0", help="0/1 veya video yolu veya rtsp://")
     p.add_argument("--model", type=str, default="yolov8n.pt")
     p.add_argument("--profile", type=str, default="balanced", choices=["speed","balanced","accuracy"])
