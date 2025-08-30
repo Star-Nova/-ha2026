@@ -1,0 +1,1159 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+İHA ALL-IN-ONE v4 (Tek Dosya)
+Modern GUI (CustomTkinter) + CLI + Tespit + Dataset + Eğitim + GPS + MAVLink
+
+Önkoşullar (ihtiyaca göre):
+    pip install ultralytics opencv-python customtkinter
+    pip install easyocr           # (opsiyonel, OCR)
+    pip install roboflow          # (opsiyonel, dataset indirme)
+    pip install pyserial pynmea2  # (opsiyonel, GPS)
+    pip install pymavlink         # (opsiyonel, MAVLink)
+    pip install tkdnd             # (opsiyonel, drag&drop; bazı platformlarda paket adı farklı olabilir)
+
+Çalıştırma:
+    GUI: python iha_all_in_one_v4.py
+    CLI: python iha_all_in_one_v4.py --cli --source 0 --model yolov8n.pt --profile balanced --ocr 0 --gps 0 --mav 0
+"""
+
+import os
+import sys
+import time
+import json
+import glob
+import math
+import queue
+import socket
+import shutil
+import threading
+import traceback
+from dataclasses import dataclass, field
+from datetime import datetime
+from collections import defaultdict, deque
+
+# OpenCV/Numpy
+import cv2
+import numpy as np
+
+# ==== Opsiyonel Kütüphaneler (varsa kullan) ====
+ULTRA_OK = True
+try:
+    from ultralytics import YOLO
+except Exception as e:
+    ULTRA_OK = False
+    YOLO = None
+
+ROBOFLOW_OK = True
+try:
+    from roboflow import Roboflow
+except Exception:
+    ROBOFLOW_OK = False
+
+OCR_OK = True
+try:
+    import easyocr
+except Exception:
+    OCR_OK = False
+
+GPS_OK = True
+try:
+    import serial, pynmea2
+except Exception:
+    GPS_OK = False
+
+MAV_OK = True
+try:
+    from pymavlink import mavutil
+except Exception:
+    MAV_OK = False
+
+# GUI
+GUI_OK = True
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox
+    import customtkinter as ctk
+except Exception:
+    GUI_OK = False
+
+# Drag & Drop (opsiyonel)
+TKDND_OK = True
+try:
+    # tkdnd paket çeşitliliğine tolerans
+    import tkdnd  # noqa: F401
+except Exception:
+    TKDND_OK = False
+
+
+# ================== Yardımcılar ==================
+
+def get_local_ip():
+    try: return socket.gethostbyname(socket.gethostname())
+    except Exception: return "unknown_local"
+
+def get_public_ip(timeout=2.0):
+    try:
+        import requests
+        return requests.get("https://api.ipify.org", timeout=timeout).text
+    except Exception:
+        return "unknown_public"
+
+def ensure_dir(p):
+    os.makedirs(p, exist_ok=True)
+    return p
+
+def readable_bytes(n):
+    if n < 1024: return f"{n} B"
+    for u in ["KB","MB","GB","TB"]:
+        n /= 1024.0
+        if n < 1024: return f"{n:.1f} {u}"
+    return f"{n:.1f} PB"
+
+
+# ================== Thread-Safe Logger ==================
+class LiveLogger:
+    def __init__(self, maxlen=2000):
+        self.q = queue.Queue()
+        self.buffer = deque(maxlen=maxlen)
+        self._listeners = []
+
+    def attach(self, callback):
+        self._listeners.append(callback)
+
+    def log(self, msg):
+        ts = datetime.now().strftime("%H:%M:%S")
+        line = f"[{ts}] {msg}"
+        self.buffer.append(line)
+        for cb in self._listeners:
+            try: cb(line)
+            except Exception: pass
+
+    def dump(self, count=500):
+        return "\n".join(list(self.buffer)[-count:])
+
+LOGGER = LiveLogger()
+
+
+# ================== GPS / MAVLink ==================
+class GPSReader:
+    def __init__(self, port: str | None, baud: int = 9600, timeout: int = 1, simulate: bool = False):
+        self.last = None
+        self.serial = None
+        self.sim = simulate or (not GPS_OK) or (not port)
+        if self.sim:
+            LOGGER.log("[GPS] Simülasyon modu.")
+        else:
+            try:
+                self.serial = serial.Serial(port, baud, timeout=timeout)
+                LOGGER.log(f"[GPS] Bağlandı: {port}")
+            except Exception as e:
+                LOGGER.log(f"[GPS] Açılamadı, simülasyona geçiliyor: {e}")
+                self.sim = True
+
+    def read(self):
+        if self.sim:
+            t = time.time()
+            lat = 40.99 + 0.00015 * math.sin(t / 9.0)
+            lon = 29.12 + 0.00015 * math.cos(t / 9.0)
+            alt = 35.0
+            self.last = (lat, lon, alt)
+            return self.last
+        if not self.serial:
+            return self.last
+        try:
+            line = self.serial.readline().decode('ascii', errors='ignore')
+            if line.startswith(("$GPGGA", "$GPRMC")):
+                msg = pynmea2.parse(line)
+                lat = getattr(msg, 'latitude', None)
+                lon = getattr(msg, 'longitude', None)
+                alt = getattr(msg, 'altitude', None)
+                self.last = (lat, lon, alt)
+                return self.last
+        except Exception:
+            pass
+        return self.last
+
+    def close(self):
+        if self.serial:
+            try: self.serial.close()
+            except Exception: pass
+
+
+class MAVLinkSender:
+    def __init__(self, conn_str: str | None, simulate: bool = False):
+        self.conn = None
+        self.sim = simulate or (not MAV_OK) or (not conn_str)
+        if self.sim:
+            LOGGER.log("[MAV] Simülasyon modu.")
+            return
+        try:
+            self.conn = mavutil.mavlink_connection(conn_str)
+            self.conn.wait_heartbeat(timeout=5)
+            LOGGER.log(f"[MAV] Bağlandı: {conn_str}")
+        except Exception as e:
+            LOGGER.log(f"[MAV] Hata, simülasyona geçiliyor: {e}")
+            self.sim = True
+
+    def send_text(self, txt: str) -> bool:
+        if self.sim:
+            LOGGER.log(f"[MAV][SIM] {txt}")
+            return True
+        if not self.conn:
+            return False
+        try:
+            self.conn.mav.statustext_send(mavutil.mavlink.MAV_SEVERITY_NOTICE, txt.encode())
+            return True
+        except Exception as e:
+            LOGGER.log(f"[MAV] Gönderim hatası: {e}")
+            return False
+
+    def close(self):
+        if self.conn:
+            try: self.conn.close()
+            except Exception: pass
+
+
+# ================== Roboflow Yardımcı ==================
+def _parse_rf_url(workspace_or_url: str, project: str | None) -> tuple[str, str]:
+    ws = workspace_or_url
+    pj = project
+    if workspace_or_url and workspace_or_url.startswith("http"):
+        parts = [p for p in workspace_or_url.split("/") if p]
+        if len(parts) >= 2:
+            pj = parts[-1]
+            ws = parts[-2]
+    if not ws or not pj:
+        raise ValueError("Roboflow workspace/project çözümlenemedi.")
+    return ws, pj
+
+def roboflow_download(api_key: str, workspace_or_url: str, project: str | None = None,
+                      version: int = 1, fmt: str = "yolov8", out_dir: str = "roboflow_download"):
+    if not ROBOFLOW_OK:
+        LOGGER.log("[RF] Roboflow SDK yok. (pip install roboflow)")
+        return None
+    try:
+        ensure_dir(out_dir)
+        ws, pj = _parse_rf_url(workspace_or_url, project)
+        LOGGER.log(f"[RF] WS:{ws} | PRJ:{pj} | VER:{version} | FMT:{fmt}")
+        rf = Roboflow(api_key=api_key)
+        prj = rf.workspace(ws).project(pj)
+        ver = prj.version(version)
+        LOGGER.log("[RF] İndiriliyor...")
+        ds = ver.download(fmt, location=out_dir)
+        LOGGER.log(f"[RF] Tamam: {ds}")
+        return ds
+    except Exception as e:
+        LOGGER.log(f"[RF] Hata: {e}")
+        return None
+
+
+# ================== Görsel Yardımcılar ==================
+def draw_label_with_background(img, text, topleft, font=cv2.FONT_HERSHEY_SIMPLEX,
+                               font_scale=0.6, thickness=1, padding=6,
+                               bg_color=(20, 20, 20), bg_alpha=0.6, text_color=(255, 255, 255)):
+    x, y = topleft
+    (w, h), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+    rect_w = w + 2 * padding
+    rect_h = h + 2 * padding
+    rect_x1 = x
+    rect_y1 = y - rect_h
+    rect_x2 = x + rect_w
+    rect_y2 = y
+    H, W = img.shape[:2]
+    if rect_y1 < 0:
+        rect_y1 = y
+        rect_y2 = y + rect_h
+    overlay = img.copy()
+    cv2.rectangle(overlay, (rect_x1, rect_y1), (rect_x2, rect_y2), bg_color, -1)
+    cv2.addWeighted(overlay, bg_alpha, img, 1 - bg_alpha, 0, img)
+    cv2.rectangle(img, (rect_x1, rect_y1), (rect_x2, rect_y2), (0, 0, 0), 1)
+    text_x = rect_x1 + padding
+    text_y = rect_y2 - padding - baseline
+    cv2.putText(img, text, (text_x + 1, text_y + 1), font, font_scale, (10, 10, 10), thickness + 1, cv2.LINE_AA)
+    cv2.putText(img, text, (text_x, text_y), font, font_scale, text_color, thickness, cv2.LINE_AA)
+
+
+# ================== Tespit Motoru ==================
+@dataclass
+class DetectorConfig:
+    model_path: str = "yolov8n.pt"
+    conf: float = 0.35
+    perf_mode: str = "balanced"  # speed / balanced / accuracy
+    device: str | None = None
+    enable_ocr: bool = False
+    enable_gps: bool = False
+    gps_port: str | None = None
+    simulate_gps: bool = False
+    enable_mav: bool = False
+    mav_conn: str | None = None
+    simulate_mav: bool = False
+    output_root: str | None = None
+    max_json: int = 200
+    max_images: int = 200
+    frame_skip: int | None = None
+    min_area: int = 80
+
+
+class IhaDetector:
+    def __init__(self, cfg: DetectorConfig):
+        if not ULTRA_OK:
+            raise RuntimeError("ultralytics (YOLOv8) gerekli. pip install ultralytics")
+        presets = {
+            "speed":    {"imgsz": 416, "save_every": 20, "ocr_every": 8, "default_skip": 1},
+            "balanced": {"imgsz": 640, "save_every": 6,  "ocr_every": 4, "default_skip": 0},
+            "accuracy": {"imgsz": 1024,"save_every": 1,  "ocr_every": 1, "default_skip": 0},
+        }
+        p = presets.get(cfg.perf_mode, presets["balanced"])
+        self.cfg = cfg
+        self.imgsz = p["imgsz"]
+        self.save_every = p["save_every"]
+        self.ocr_every = p["ocr_every"]
+        self.frame_skip = p["default_skip"] if cfg.frame_skip is None else max(0, int(cfg.frame_skip))
+
+        LOGGER.log(f"[YOLO] Model yükleniyor: {cfg.model_path}")
+        self.model = YOLO(cfg.model_path)
+        self.names = getattr(self.model, "names", {0: "object"})
+
+        # OCR
+        self.enable_ocr = cfg.enable_ocr and OCR_OK
+        self.ocr = None
+        if self.enable_ocr:
+            try:
+                self.ocr = easyocr.Reader(['tr', 'en'])
+                LOGGER.log("[OCR] Etkin.")
+            except Exception as e:
+                LOGGER.log(f"[OCR] Başlatılamadı: {e}")
+                self.enable_ocr = False
+
+        # GPS/MAV
+        self.gps = GPSReader(cfg.gps_port, simulate=cfg.simulate_gps) if cfg.enable_gps else None
+        self.mav = MAVLinkSender(cfg.mav_conn, simulate=cfg.simulate_mav) if cfg.enable_mav else None
+
+        # kayıt
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.root = cfg.output_root or f"iha_session_{ts}"
+        ensure_dir(self.root)
+        self.img_dir = ensure_dir(os.path.join(self.root, "annotated_images"))
+        self.json_dir = ensure_dir(os.path.join(self.root, "json"))
+        self.csv_path = os.path.join(self.root, "detections.csv")
+        if not os.path.exists(self.csv_path):
+            with open(self.csv_path, "w", encoding="utf-8") as f:
+                f.write("timestamp,frame,class,conf,x1,y1,x2,y2,cx,cy,area,color,shape,text,gps_lat,gps_lon,gps_alt\n")
+
+        self.frame_id = 0
+        self.start_time = time.time()
+        self.counts = defaultdict(int)
+        self._recent_json = deque(sorted(glob.glob(os.path.join(self.json_dir, "*.json"))))
+        self._recent_imgs = deque(sorted(glob.glob(os.path.join(self.img_dir, "*.jpg"))))
+
+        # Renk aralıkları
+        self.base_color_ranges = {
+            "kirmizi": [(0, 70, 50), (10, 255, 255), (170, 70, 50), (180, 255, 255)],
+            "mavi":    [(100, 120, 50), (130, 255, 255)],
+            "yesil":   [(40, 40, 40),  (80, 255, 255)],
+            "sari":    [(15, 100, 100),(35, 255, 255)],
+        }
+        LOGGER.log(f"[SYS] Local IP: {get_local_ip()} | Public IP: {get_public_ip()}")
+
+    def _rotate_files(self, path_list: deque, limit: int):
+        while len(path_list) > limit:
+            p = path_list.popleft()
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+
+    def _adapt_ranges(self, hsv_roi):
+        v_mean = hsv_roi[..., 2].mean() if hsv_roi.size else 128.0
+        scale = 1.0
+        if v_mean < 80: scale = 0.8
+        elif v_mean > 180: scale = 1.1
+        ranges = {}
+        for name, r in self.base_color_ranges.items():
+            if name == "kirmizi" and len(r) == 4:
+                r0 = (r[0][0], int(r[0][1] * scale), int(r[0][2] * scale))
+                r1 = (r[1][0], int(r[1][1] * scale), int(r[1][2] * scale))
+                r2 = (r[2][0], int(r[2][1] * scale), int(r[2][2] * scale))
+                r3 = (r[3][0], int(r[3][1] * scale), int(r[3][2] * scale))
+                ranges[name] = [r0, r1, r2, r3]
+            else:
+                r0 = (r[0][0], int(r[0][1] * scale), int(r[0][2] * scale))
+                r1 = (r[1][0], int(r[1][1] * scale), int(r[1][2] * scale))
+                ranges[name] = [r0, r1]
+        return ranges
+
+    def detect_color(self, frame, bbox):
+        x1, y1, x2, y2 = map(int, bbox)
+        H, W = frame.shape[:2]
+        x1 = max(0, min(W - 1, x1)); x2 = max(0, min(W - 1, x2))
+        y1 = max(0, min(H - 1, y1)); y2 = max(0, min(H - 1, y2))
+        roi = frame[y1:y2, x1:x2]
+        if roi.size == 0: return "belirsiz", 0.0
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        ranges = self._adapt_ranges(hsv)
+        total = hsv.shape[0] * hsv.shape[1]
+        best = ("belirsiz", 0.0)
+        for name, r in ranges.items():
+            if name == "kirmizi" and len(r) == 4:
+                mask1 = cv2.inRange(hsv, np.array(r[0]), np.array(r[1]))
+                mask2 = cv2.inRange(hsv, np.array(r[2]), np.array(r[3]))
+                mask = cv2.bitwise_or(mask1, mask2)
+            else:
+                mask = cv2.inRange(hsv, np.array(r[0]), np.array(r[1]))
+            cnt = int(np.count_nonzero(mask))
+            score = cnt / float(total) if total > 0 else 0.0
+            if score > best[1]:
+                best = (name, score)
+        return best if best[1] > 0.07 else ("belirsiz", best[1])
+
+    def detect_shape(self, frame, bbox):
+        x1, y1, x2, y2 = map(int, bbox)
+        H, W = frame.shape[:2]
+        x1 = max(0, min(W - 1, x1)); x2 = max(0, min(W - 1, x2))
+        y1 = max(0, min(H - 1, y1)); y2 = max(0, min(H - 1, y2))
+        roi = frame[y1:y2, x1:x2]
+        if roi.size == 0: return "belirsiz"
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        gray = cv2.equalizeHist(gray)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        edges = cv2.Canny(blur, 50, 150)
+        cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts: return "belirsiz"
+        c = max(cnts, key=cv2.contourArea)
+        if cv2.contourArea(c) < 50: return "kucuk"
+        eps = 0.04 * cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, eps, True)
+        v = len(approx)
+        if v == 3: return "ucgen"
+        if v == 4:
+            x, y, w, h = cv2.boundingRect(approx)
+            ar = float(w) / h if h > 0 else 0
+            return "kare" if 0.9 <= ar <= 1.1 else "dikdortgen"
+        if v > 8: return "daire"
+        return f"{v}gen"
+
+    def read_text(self, frame, bbox):
+        if not self.enable_ocr or self.ocr is None: return ""
+        if (self.frame_id % self.ocr_every) != 0:   return ""
+        x1, y1, x2, y2 = map(int, bbox)
+        H, W = frame.shape[:2]
+        x1 = max(0, min(W - 1, x1)); x2 = max(0, min(W - 1, x2))
+        y1 = max(0, min(H - 1, y1)); y2 = max(0, min(H - 1, y2))
+        roi = frame[y1:y2, x1:x2]
+        if roi.size == 0: return ""
+        try:
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            gray = cv2.bilateralFilter(gray, 7, 50, 50)
+            res = self.ocr.readtext(gray, detail=0, paragraph=True)
+            if res:
+                txt = max(res, key=len).strip()
+                txt = ''.join(c for c in txt if c.isalnum() or c.isspace())
+                return txt
+        except Exception:
+            return ""
+        return ""
+
+    def draw_detection(self, frame, det):
+        x1, y1, x2, y2 = det["bbox"]
+        col_map = {
+            "kirmizi": (0, 0, 255),
+            "mavi":    (255, 0, 0),
+            "yesil":   (0, 255, 0),
+            "sari":    (0, 255, 255),
+            "belirsiz":(180, 180, 180),
+        }
+        base_color = col_map.get(det["color"], (255, 255, 255))
+        cv2.rectangle(frame, (x1, y1), (x2, y2), base_color, 2)
+        label = f"{det['class']} {det['conf']:.2f} | {det['color']} {det['shape']}"
+        if det["text"]:
+            label += f" '{det['text'][:12]}'"
+        draw_label_with_background(frame, label, (x1, max(0, y1-2)), font_scale=0.55, thickness=1,
+                                   bg_color=(30,30,30), bg_alpha=0.65, text_color=(255,255,255))
+
+    def draw_overlay(self, frame, fps, det_count):
+        info_lines = [f"FPS: {fps:.1f}", f"Frame: {self.frame_id}", f"Det: {det_count}"]
+        panel_w = 220
+        panel_h = 20 * len(info_lines) + 16
+        panel_x1 = 8
+        panel_y1 = 8
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (panel_x1, panel_y1), (panel_x1 + panel_w, panel_y1 + panel_h), (10,10,10), -1)
+        cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
+        for i, l in enumerate(info_lines):
+            cv2.putText(frame, l, (panel_x1 + 8, panel_y1 + 18 + 20 * i),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200,255,200), 1, cv2.LINE_AA)
+
+    def save_detections(self, detections, frame):
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        jpath = os.path.join(self.json_dir, f"detections_{ts}.json")
+        with open(jpath, "w", encoding="utf-8") as f:
+            json.dump(detections, f, ensure_ascii=False, indent=2)
+        imgpath = os.path.join(self.img_dir, f"annot_{ts}.jpg")
+        cv2.imwrite(imgpath, frame)
+        with open(self.csv_path, "a", encoding="utf-8") as f:
+            for d in detections:
+                gps = d.get("gps") or (None, None, None)
+                safe_text = (d.get("text") or "").replace('"', '')
+                line = ",".join([
+                    d["timestamp"], str(d["frame"]), d["class"], f"{d['conf']:.3f}",
+                    str(d["bbox"][0]), str(d["bbox"][1]), str(d["bbox"][2]), str(d["bbox"][3]),
+                    str(d["center"][0]), str(d["center"][1]), str(d["area"]),
+                    d["color"], d["shape"], f'"{safe_text}"',
+                    str(gps[0] if len(gps) > 0 else ""), str(gps[1] if len(gps) > 1 else ""), str(gps[2] if len(gps) > 2 else ""),
+                ])
+                f.write(line + "\n")
+        self._recent_json.append(jpath)
+        self._recent_imgs.append(imgpath)
+        self._rotate_files(self._recent_json, self.cfg.max_json)
+        self._rotate_files(self._recent_imgs, self.cfg.max_images)
+        LOGGER.log(f"[LOG] Kaydedildi: {os.path.basename(jpath)} & {os.path.basename(imgpath)}")
+
+    def process_frame(self, frame):
+        self.frame_id += 1
+        # Frame skip (basit)
+        if self.frame_skip and (self.frame_id % (self.frame_skip + 1) != 1):
+            annotated = frame.copy()
+            self.draw_overlay(annotated, fps=0.0, det_count=0)
+            return annotated, []
+
+        t0 = time.time()
+        h, w = frame.shape[:2]
+        maxd = max(h, w)
+        if maxd > self.imgsz:
+            scale = self.imgsz / float(maxd)
+            frame = cv2.resize(frame, (int(w*scale), int(h*scale)))
+
+        # YOLO inference
+        results = self.model(frame, conf=self.cfg.conf, verbose=False, device=self.cfg.device)
+        detections = []
+        gps = self.gps.read() if self.gps else None
+
+        for r in results:
+            if getattr(r, 'boxes', None) is None:
+                continue
+            for box in r.boxes:
+                xyxy = box.xyxy[0].cpu().numpy().tolist()
+                conf = float(box.conf[0].cpu().numpy())
+                cls = int(box.cls[0].cpu().numpy())
+                cls_name = self.names.get(cls, f"class_{cls}")
+                x1, y1, x2, y2 = map(int, xyxy)
+                area = max(0, (x2 - x1) * (y2 - y1))
+                if area < self.cfg.min_area:
+                    continue
+
+                color, color_conf = self.detect_color(frame, (x1, y1, x2, y2))
+                shape = self.detect_shape(frame, (x1, y1, x2, y2))
+                text = self.read_text(frame, (x1, y1, x2, y2))
+
+                det = {
+                    "timestamp": datetime.now().isoformat(),
+                    "frame": self.frame_id,
+                    "class": cls_name,
+                    "conf": conf,
+                    "bbox": [x1, y1, x2, y2],
+                    "center": [int((x1+x2)/2), int((y1+y2)/2)],
+                    "area": area,
+                    "color": color,
+                    "color_conf": float(color_conf),
+                    "shape": shape,
+                    "text": text,
+                    "gps": gps,
+                }
+                detections.append(det)
+                self.draw_detection(frame, det)
+                self.counts[f"{cls_name}|{color}|{shape}"] += 1
+
+                if self.mav and gps and gps[0] and gps[1]:
+                    msg = f"DETECT:{cls_name} LAT:{gps[0]:.6f} LON:{gps[1]:.6f}"
+                    self.mav.send_text(msg)
+
+        dt = time.time() - t0
+        fps = 1.0/dt if dt > 0 else 0.0
+        self.draw_overlay(frame, fps, len(detections))
+
+        # periyodik kaydetme
+        if detections and (self.frame_id % self.save_every == 0):
+            self.save_detections(detections, frame)
+        return frame, detections
+
+    # ==== Döngüler ====
+    def run_camera(self, source=0, show_original=True):
+        LOGGER.log(f"[CAM] Açılıyor: {source}")
+        cap = cv2.VideoCapture(source)
+        try:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            cap.set(cv2.CAP_PROP_FPS, 30)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+        if not cap.isOpened():
+            LOGGER.log("[CAM] Açılamadı.")
+            return
+
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    LOGGER.log("[CAM] Frame okunamadı, bitiyor.")
+                    break
+                annotated, _ = self.process_frame(frame.copy())
+                cv2.imshow("Original" if show_original else "Annotated", frame if show_original else annotated)
+                if show_original:
+                    cv2.imshow("Annotated", annotated)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'): break
+                elif key == ord('s'):
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    p = os.path.join(self.img_dir, f"manual_{ts}.jpg")
+                    cv2.imwrite(p, annotated)
+                    LOGGER.log(f"[CAM] Manuel kaydedildi: {p}")
+        except KeyboardInterrupt:
+            LOGGER.log("[CAM] İptal.")
+        finally:
+            cap.release()
+            cv2.destroyAllWindows()
+            self.final_report()
+            if self.mav: self.mav.close()
+            if self.gps: self.gps.close()
+
+    def run_video(self, path, output=None, show_original=False):
+        LOGGER.log(f"[VID] İşleniyor: {path}")
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            LOGGER.log("[VID] Açılamadı.")
+            return
+        out = None
+        if output:
+            fps = cap.get(cv2.CAP_PROP_FPS) or 25
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(output, fourcc, fps, (w, h))
+            LOGGER.log(f"[VID] Çıkış yazılıyor: {output}")
+
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret: break
+                annotated, _ = self.process_frame(frame.copy())
+                if out: out.write(annotated)
+                cv2.imshow("Original" if show_original else "Annotated", frame if show_original else annotated)
+                if show_original: cv2.imshow("Annotated", annotated)
+                if (self.frame_id % 30) == 0:
+                    LOGGER.log(f"[VID] Frame: {self.frame_id}")
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+        finally:
+            cap.release()
+            if out: out.release()
+            cv2.destroyAllWindows()
+            self.final_report()
+            if self.mav: self.mav.close()
+            if self.gps: self.gps.close()
+
+    def run_demo_images(self, folder, delay=800):
+        imgs = sorted([p for p in glob.glob(os.path.join(folder, "**/*.*"), recursive=True)
+                       if p.lower().endswith((".jpg",".jpeg",".png"))])
+        if not imgs:
+            LOGGER.log("[DEMO] Görüntü yok.")
+            return
+        LOGGER.log(f"[DEMO] {len(imgs)} görüntü | delay:{delay}ms")
+        for pth in imgs:
+            img = cv2.imread(pth)
+            if img is None: continue
+            annotated, dets = self.process_frame(img.copy())
+            cv2.imshow("Demo Original", img)
+            cv2.imshow("Demo Annotated", annotated)
+            LOGGER.log(f"[DEMO] {os.path.basename(pth)} | Tespit:{[d['class'] for d in dets]}")
+            k = cv2.waitKey(delay) & 0xFF
+            if k == ord('q'): break
+        cv2.destroyAllWindows()
+        self.final_report()
+
+    def final_report(self):
+        elapsed = time.time() - self.start_time
+        avg = self.frame_id/elapsed if elapsed>0 else 0
+        LOGGER.log(f"--- ÖZET --- Süre:{elapsed:.1f}s | Frame:{self.frame_id} | Ortalama FPS:{avg:.2f}")
+        top = sorted(self.counts.items(), key=lambda x:-x[1])[:20]
+        for k, v in top:
+            LOGGER.log(f"  {k}: {v}")
+        LOGGER.log(f"Kayıt dizin: {self.root}")
+
+
+# ================== GUI (CustomTkinter) ==================
+if GUI_OK:
+    ctk.set_appearance_mode("dark")
+    ctk.set_default_color_theme("blue")
+
+class VideoThread(threading.Thread):
+    def __init__(self, app, detector: IhaDetector, source, show_original=True, output_video=None):
+        super().__init__(daemon=True)
+        self.app = app
+        self.detector = detector
+        self.source = source
+        self.show_original = show_original
+        self.output_video = output_video
+        self.running = True
+
+    def stop(self):
+        self.running = False
+
+    def run(self):
+        try:
+            cap = cv2.VideoCapture(self.source)
+            if not cap.isOpened():
+                LOGGER.log("[GUI] Kaynak açılamadı.")
+                return
+            out = None
+            if self.output_video:
+                fps = cap.get(cv2.CAP_PROP_FPS) or 25
+                w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                out = cv2.VideoWriter(self.output_video, fourcc, fps, (w, h))
+                LOGGER.log(f"[GUI] Video çıkışı: {self.output_video}")
+
+            while self.running:
+                ret, frame = cap.read()
+                if not ret: break
+                annotated, dets = self.detector.process_frame(frame.copy())
+                if out: out.write(annotated)
+
+                # GUI canvas’larına gönder
+                self.app.update_stats(self.detector.frame_id, len(dets))
+                self.app.update_images(frame if self.show_original else annotated, annotated)
+
+                # key events (manuel kaydet)
+                if self.detector.frame_id % 60 == 0:
+                    self.app.flush_logs()
+
+            cap.release()
+            if out: out.release()
+        except Exception as e:
+            LOGGER.log(f"[GUI] VideoThread hata: {e}")
+            traceback.print_exc()
+        finally:
+            self.app.on_stream_end()
+
+class AppGUI:
+    def __init__(self):
+        self.root = ctk.CTk()
+        self.root.title("İHA ALL-IN-ONE v4")
+        self.root.geometry("1280x800")
+        self.root.minsize(1100, 700)
+
+        self.detector: IhaDetector | None = None
+        self.worker: VideoThread | None = None
+        self.current_mode = "camera"  # camera / video / demo
+        self.dark_mode = True
+
+        # ---- Layout: left menu, right stats+log, bottom views ----
+        self._build_layout()
+        self._bind_dragdrop()
+        LOGGER.attach(self._on_new_log)
+
+        # default fields
+        self.model_var.set("yolov8n.pt")
+        self.profile_var.set("balanced")
+        self.conf_var.set(0.35)
+        self.device_var.set("")
+        self.rtsp_var.set("0")  # default: webcam 0
+
+    # ---------- UI Builders ----------
+    def _build_layout(self):
+        self.root.grid_rowconfigure(1, weight=1)
+        self.root.grid_columnconfigure(0, weight=0)
+        self.root.grid_columnconfigure(1, weight=1)
+
+        # Left panel (menu)
+        self.left = ctk.CTkFrame(self.root, corner_radius=12)
+        self.left.grid(row=0, column=0, rowspan=2, sticky="nsw", padx=10, pady=10)
+        self.left.grid_rowconfigure(9, weight=1)
+
+        ctk.CTkLabel(self.left, text="Menü", font=ctk.CTkFont(size=18, weight="bold")).grid(row=0, column=0, padx=10, pady=(10,6), sticky="w")
+
+        # Source
+        self.rtsp_var = tk.StringVar()
+        ctk.CTkLabel(self.left, text="Kamera/RTSP/HTTP:").grid(row=1, column=0, padx=10, sticky="w")
+        self.rtsp_entry = ctk.CTkEntry(self.left, textvariable=self.rtsp_var, width=260, placeholder_text="0, 1 veya rtsp://...")
+        self.rtsp_entry.grid(row=2, column=0, padx=10, pady=4, sticky="w")
+
+        self.video_path = tk.StringVar()
+        ctk.CTkButton(self.left, text="Video Seç", command=self._select_video).grid(row=3, column=0, padx=10, pady=4, sticky="ew")
+        self.video_label = ctk.CTkLabel(self.left, textvariable=self.video_path, wraplength=260)
+        self.video_label.grid(row=4, column=0, padx=10, pady=(0,6), sticky="w")
+
+        # Model & profile
+        self.model_var = tk.StringVar()
+        ctk.CTkLabel(self.left, text="Model:").grid(row=5, column=0, padx=10, pady=(8,0), sticky="w")
+        self.model_entry = ctk.CTkEntry(self.left, textvariable=self.model_var, width=260, placeholder_text="yolov8n.pt")
+        self.model_entry.grid(row=6, column=0, padx=10, pady=4, sticky="w")
+
+        self.profile_var = tk.StringVar()
+        ctk.CTkLabel(self.left, text="Profil:").grid(row=7, column=0, padx=10, pady=(8,0), sticky="w")
+        self.profile_combo = ctk.CTkComboBox(self.left, values=["speed","balanced","accuracy"], variable=self.profile_var)
+        self.profile_combo.grid(row=8, column=0, padx=10, pady=4, sticky="w")
+
+        # Conf, device
+        self.conf_var = tk.DoubleVar(value=0.35)
+        ctk.CTkLabel(self.left, text="Confidence:").grid(row=9, column=0, padx=10, pady=(8,0), sticky="w")
+        self.conf_slider = ctk.CTkSlider(self.left, from_=0.1, to=0.9, number_of_steps=80, variable=self.conf_var)
+        self.conf_slider.grid(row=10, column=0, padx=10, pady=4, sticky="ew")
+
+        self.device_var = tk.StringVar()
+        ctk.CTkLabel(self.left, text="Device (cuda/cpu boş=auto):").grid(row=11, column=0, padx=10, pady=(8,0), sticky="w")
+        self.device_entry = ctk.CTkEntry(self.left, textvariable=self.device_var, width=260, placeholder_text="")
+        self.device_entry.grid(row=12, column=0, padx=10, pady=4, sticky="w")
+
+        # Toggles
+        self.ocr_var = tk.IntVar(value=0)
+        self.gps_var = tk.IntVar(value=0)
+        self.mav_var = tk.IntVar(value=0)
+        self.sim_gps_var = tk.IntVar(value=1)
+        self.sim_mav_var = tk.IntVar(value=1)
+        self.gps_port_var = tk.StringVar()
+        self.mav_conn_var = tk.StringVar()
+
+        ctk.CTkCheckBox(self.left, text="OCR", variable=self.ocr_var).grid(row=13, column=0, padx=10, pady=(8,0), sticky="w")
+        ctk.CTkCheckBox(self.left, text="GPS", variable=self.gps_var).grid(row=14, column=0, padx=10, pady=2, sticky="w")
+        ctk.CTkEntry(self.left, textvariable=self.gps_port_var, placeholder_text="GPS Port (COM3 or /dev/ttyUSB0)").grid(row=15, column=0, padx=10, pady=2, sticky="ew")
+        ctk.CTkCheckBox(self.left, text="GPS Simülasyon", variable=self.sim_gps_var).grid(row=16, column=0, padx=10, pady=2, sticky="w")
+        ctk.CTkCheckBox(self.left, text="MAVLink", variable=self.mav_var).grid(row=17, column=0, padx=10, pady=2, sticky="w")
+        ctk.CTkEntry(self.left, textvariable=self.mav_conn_var, placeholder_text="udp:127.0.0.1:14550").grid(row=18, column=0, padx=10, pady=2, sticky="ew")
+        ctk.CTkCheckBox(self.left, text="MAV Simülasyon", variable=self.sim_mav_var).grid(row=19, column=0, padx=10, pady=2, sticky="w")
+
+        # Actions
+        ctk.CTkButton(self.left, text="Canlı Başlat", command=self.start_live).grid(row=20, column=0, padx=10, pady=(10,4), sticky="ew")
+        ctk.CTkButton(self.left, text="Video Oynat", command=self.start_video).grid(row=21, column=0, padx=10, pady=4, sticky="ew")
+        ctk.CTkButton(self.left, text="Demo Klasör", command=self.start_demo).grid(row=22, column=0, padx=10, pady=4, sticky="ew")
+        ctk.CTkButton(self.left, text="Durdur", fg_color="#a33", command=self.stop_stream).grid(row=23, column=0, padx=10, pady=4, sticky="ew")
+
+        # Dataset & Train
+        ctk.CTkLabel(self.left, text="Roboflow", font=ctk.CTkFont(weight="bold")).grid(row=24, column=0, padx=10, pady=(12,2), sticky="w")
+        self.rf_key = tk.StringVar(); self.rf_ws = tk.StringVar(); self.rf_pj = tk.StringVar(); self.rf_ver = tk.StringVar(value="1"); self.rf_fmt = tk.StringVar(value="yolov8")
+        ctk.CTkEntry(self.left, textvariable=self.rf_key, placeholder_text="RF API Key").grid(row=25, column=0, padx=10, pady=2, sticky="ew")
+        ctk.CTkEntry(self.left, textvariable=self.rf_ws, placeholder_text="Workspace veya URL").grid(row=26, column=0, padx=10, pady=2, sticky="ew")
+        ctk.CTkEntry(self.left, textvariable=self.rf_pj, placeholder_text="Project (URL verdiysen boş)").grid(row=27, column=0, padx=10, pady=2, sticky="ew")
+        ctk.CTkEntry(self.left, textvariable=self.rf_ver, placeholder_text="Version (1)").grid(row=28, column=0, padx=10, pady=2, sticky="ew")
+        ctk.CTkEntry(self.left, textvariable=self.rf_fmt, placeholder_text="Format (yolov8/yolov5/coco)").grid(row=29, column=0, padx=10, pady=2, sticky="ew")
+        ctk.CTkButton(self.left, text="Dataset İndir", command=self._download_dataset).grid(row=30, column=0, padx=10, pady=4, sticky="ew")
+
+        ctk.CTkLabel(self.left, text="Eğitim", font=ctk.CTkFont(weight="bold")).grid(row=31, column=0, padx=10, pady=(12,2), sticky="w")
+        self.train_data = tk.StringVar(); self.train_epochs = tk.IntVar(value=50); self.train_imgsz = tk.IntVar(value=640)
+        ctk.CTkEntry(self.left, textvariable=self.train_data, placeholder_text="data.yaml yolu").grid(row=32, column=0, padx=10, pady=2, sticky="ew")
+        ctk.CTkEntry(self.left, textvariable=self.train_epochs, placeholder_text="epochs").grid(row=33, column=0, padx=10, pady=2, sticky="ew")
+        ctk.CTkEntry(self.left, textvariable=self.train_imgsz, placeholder_text="imgsz").grid(row=34, column=0, padx=10, pady=2, sticky="ew")
+        ctk.CTkButton(self.left, text="Eğitimi Başlat", command=self._start_train).grid(row=35, column=0, padx=10, pady=4, sticky="ew")
+
+        # Theme toggle
+        ctk.CTkButton(self.left, text="Açık/Karanlık", command=self._toggle_theme).grid(row=36, column=0, padx=10, pady=(10,10), sticky="ew")
+
+        # Right panel (stats + log)
+        right = ctk.CTkFrame(self.root, corner_radius=12)
+        right.grid(row=0, column=1, sticky="new", padx=(0,10), pady=10)
+        right.grid_columnconfigure(0, weight=1)
+
+        self.stat_fps = tk.StringVar(value="FPS: 0.0")
+        self.stat_frame = tk.StringVar(value="Frame: 0")
+        self.stat_det = tk.StringVar(value="Tespit: 0")
+
+        statbar = ctk.CTkFrame(right)
+        statbar.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
+        ctk.CTkLabel(statbar, textvariable=self.stat_fps).grid(row=0, column=0, padx=6, pady=4)
+        ctk.CTkLabel(statbar, textvariable=self.stat_frame).grid(row=0, column=1, padx=6, pady=4)
+        ctk.CTkLabel(statbar, textvariable=self.stat_det).grid(row=0, column=2, padx=6, pady=4)
+
+        self.log_text = ctk.CTkTextbox(right, height=180)
+        self.log_text.grid(row=1, column=0, sticky="ew", padx=8, pady=(0,8))
+        self.log_text.insert("end", "Log başlatıldı...\n")
+        self.log_text.configure(state="disabled")
+
+        # Bottom panel (images)
+        bottom = ctk.CTkFrame(self.root, corner_radius=12)
+        bottom.grid(row=1, column=1, sticky="nsew", padx=(0,10), pady=(0,10))
+        bottom.grid_rowconfigure(0, weight=1)
+        bottom.grid_columnconfigure((0,1), weight=1)
+
+        self.canvas_orig = ctk.CTkLabel(bottom, text="Orijinal")
+        self.canvas_annot = ctk.CTkLabel(bottom, text="Annotasyonlu")
+        self.canvas_orig.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+        self.canvas_annot.grid(row=0, column=1, sticky="nsew", padx=8, pady=8)
+
+    def _bind_dragdrop(self):
+        if not TKDND_OK: return
+        try:
+            self.root.drop_target_register('DND_Files')
+            self.root.dnd_bind('<<Drop>>', self._on_drop_files)
+        except Exception:
+            pass
+
+    # ---------- UI Events ----------
+    def _on_drop_files(self, event):
+        paths = self.root.splitlist(event.data)
+        # ilk destek: video dosyası
+        if paths:
+            self.video_path.set(paths[0])
+            LOGGER.log(f"[DND] Dosya: {paths[0]}")
+
+    def _on_new_log(self, line: str):
+        try:
+            self.log_text.configure(state="normal")
+            self.log_text.insert("end", line + "\n")
+            self.log_text.see("end")
+            self.log_text.configure(state="disabled")
+        except Exception:
+            pass
+
+    def flush_logs(self):
+        # currently real-time; placeholder
+        pass
+
+    def _toggle_theme(self):
+        self.dark_mode = not self.dark_mode
+        ctk.set_appearance_mode("dark" if self.dark_mode else "light")
+
+    def _select_video(self):
+        path = filedialog.askopenfilename(filetypes=[("Video","*.mp4;*.avi;*.mov;*.mkv"), ("All","*.*")])
+        if path:
+            self.video_path.set(path)
+            LOGGER.log(f"[GUI] Video seçildi: {path}")
+
+    def _download_dataset(self):
+        api = self.rf_key.get().strip()
+        ws_or_url = self.rf_ws.get().strip()
+        pj = self.rf_pj.get().strip() or None
+        ver = int(self.rf_ver.get().strip() or "1")
+        fmt = self.rf_fmt.get().strip() or "yolov8"
+        threading.Thread(target=roboflow_download, args=(api, ws_or_url, pj, ver, fmt, "roboflow_download"), daemon=True).start()
+
+    def _start_train(self):
+        if not ULTRA_OK:
+            messagebox.showerror("Hata", "ultralytics kurulu değil.")
+            return
+        data = self.train_data.get().strip()
+        epochs = int(self.train_epochs.get() or 50)
+        imgsz = int(self.train_imgsz.get() or 640)
+        model_path = self.model_var.get().strip() or "yolov8n.pt"
+
+        def _worker():
+            try:
+                LOGGER.log(f"[TRAIN] Başlıyor: model={model_path}, data={data}, epochs={epochs}, imgsz={imgsz}")
+                mdl = YOLO(model_path)
+                res = mdl.train(data=data, epochs=epochs, imgsz=imgsz, device=self.device_var.get() or None)
+                LOGGER.log("[TRAIN] Tamamlandı.")
+                LOGGER.log(str(res))
+            except Exception as e:
+                LOGGER.log(f"[TRAIN] Hata: {e}")
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _build_detector(self):
+        try:
+            cfg = DetectorConfig(
+                model_path=self.model_var.get().strip() or "yolov8n.pt",
+                conf=float(self.conf_var.get()),
+                perf_mode=self.profile_var.get(),
+                device=(self.device_var.get().strip() or None),
+                enable_ocr=bool(self.ocr_var.get()),
+                enable_gps=bool(self.gps_var.get()),
+                gps_port=(self.gps_port_var.get().strip() or None),
+                simulate_gps=bool(self.sim_gps_var.get()),
+                enable_mav=bool(self.mav_var.get()),
+                mav_conn=(self.mav_conn_var.get().strip() or None),
+                simulate_mav=bool(self.sim_mav_var.get()),
+            )
+            self.detector = IhaDetector(cfg)
+            return True
+        except Exception as e:
+            LOGGER.log(f"[GUI] Detector init hata: {e}")
+            traceback.print_exc()
+            messagebox.showerror("Hata", f"Detector başlatılamadı:\n{e}")
+            return False
+
+    def start_live(self):
+        if self.worker:
+            messagebox.showinfo("Bilgi","Önce mevcut akışı durdur.")
+            return
+        if not self._build_detector(): return
+        src = self.rtsp_var.get().strip() or "0"
+        try:
+            src = int(src)
+        except Exception:
+            pass
+        self.current_mode = "camera"
+        self.worker = VideoThread(self, self.detector, src, show_original=True)
+        self.worker.start()
+        LOGGER.log("[GUI] Canlı akış başladı.")
+
+    def start_video(self):
+        if self.worker:
+            messagebox.showinfo("Bilgi","Önce mevcut akışı durdur.")
+            return
+        if not self._build_detector(): return
+        vp = self.video_path.get().strip()
+        if not vp: 
+            messagebox.showwarning("Uyarı","Video dosyası seç.")
+            return
+        self.current_mode = "video"
+        outp = None  # istersen buraya dosya adı yazdırabilirsin
+        self.worker = VideoThread(self, self.detector, vp, show_original=False, output_video=outp)
+        self.worker.start()
+        LOGGER.log("[GUI] Video oynatma başladı.")
+
+    def start_demo(self):
+        if self.worker:
+            messagebox.showinfo("Bilgi","Önce mevcut akışı durdur.")
+            return
+        if not self._build_detector(): return
+        folder = filedialog.askdirectory()
+        if not folder:
+            return
+
+        def _demo():
+            self.current_mode = "demo"
+            try:
+                imgs = sorted([p for p in glob.glob(os.path.join(folder, "**/*.*"), recursive=True)
+                               if p.lower().endswith((".jpg",".jpeg",".png"))])
+                if not imgs:
+                    LOGGER.log("[DEMO] Görüntü bulunamadı.")
+                    return
+                LOGGER.log(f"[DEMO] {len(imgs)} görüntü.")
+                for pth in imgs:
+                    img = cv2.imread(pth)
+                    if img is None: continue
+                    annotated, dets = self.detector.process_frame(img.copy())
+                    self.update_stats(self.detector.frame_id, len(dets))
+                    self.update_images(img, annotated)
+                    time.sleep(0.08)  # 12-13 fps demo
+            finally:
+                self.on_stream_end()
+
+        threading.Thread(target=_demo, daemon=True).start()
+
+    def stop_stream(self):
+        if self.worker:
+            self.worker.stop()
+            self.worker = None
+            LOGGER.log("[GUI] Durduruldu.")
+
+    def on_stream_end(self):
+        self.worker = None
+        LOGGER.log("[GUI] Akış bitti.")
+
+    # ---------- Image Updates ----------
+    def _to_ctk_image(self, img_bgr, max_w=800, max_h=600):
+        if img_bgr is None: return None
+        h, w = img_bgr.shape[:2]
+        scale = min(max_w / w, max_h / h, 1.0)
+        if scale < 1.0:
+            img_bgr = cv2.resize(img_bgr, (int(w*scale), int(h*scale)))
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        from PIL import Image, ImageTk
+        im = Image.fromarray(img_rgb)
+        return ImageTk.PhotoImage(im)
+
+    def update_images(self, img_orig, img_annot):
+        try:
+            im1 = self._to_ctk_image(img_orig)
+            im2 = self._to_ctk_image(img_annot)
+            if im1:
+                self.canvas_orig.configure(image=im1, text="")
+                self.canvas_orig.image = im1
+            if im2:
+                self.canvas_annot.configure(image=im2, text="")
+                self.canvas_annot.image = im2
+        except Exception:
+            pass
+
+    def update_stats(self, frame_id, det_count):
+        # FPS, process_frame içinde overlay’de var; burada basit bir tahmin:
+        # GUI tarafında son 30 frame süresi ölçümü (opsiyonel)
+        self.stat_frame.set(f"Frame: {frame_id}")
+        self.stat_det.set(f"Tespit: {det_count}")
+        # istemci fps göstergesi basit:
+        # daha doğru FPS overlay’dedir; burada sabit bilgi güncellenir
+        # (istersen bir hareketli ortalama ekleyebilirsin)
+        self.stat_fps.set("FPS: canlı")
+
+    def run(self):
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.mainloop()
+
+    def _on_close(self):
+        try:
+            self.stop_stream()
+        except Exception:
+            pass
+        self.root.destroy()
+
+
+# ================== CLI ==================
+def run_cli():
+    import argparse
+    p = argparse.ArgumentParser(description="İHA ALL-IN-ONE v4")
+    p.add_argument("--source", type=str, default="0", help="0/1 veya video yolu veya rtsp://")
+    p.add_argument("--model", type=str, default="yolov8n.pt")
+    p.add_argument("--profile", type=str, default="balanced", choices=["speed","balanced","accuracy"])
+    p.add_argument("--conf", type=float, default=0.35)
+    p.add_argument("--device", type=str, default="")
+    p.add_argument("--ocr", type=int, default=0)
+    p.add_argument("--gps", type=int, default=0)
+    p.add_argument("--gps_port", type=str, default="")
+    p.add_argument("--sim_gps", type=int, default=1)
+    p.add_argument("--mav", type=int, default=0)
+    p.add_argument("--mav_conn", type=str, default="")
+    p.add_argument("--sim_mav", type=int, default=1)
+    p.add_argument("--video_out", type=str, default="")
+    p.add_argument("--demo", type=str, default="")
+    p.add_argument("--cli", action="store_true", help="CLI modda çalıştır")
+    args = p.parse_args()
+
+    LOGGER.log(f"[CLI] Local:{get_local_ip()} Public:{get_public_ip()}")
+    # detector
+    cfg = DetectorConfig(
+        model_path=args.model, conf=args.conf, perf_mode=args.profile,
+        device=(args.device or None),
+        enable_ocr=bool(args.ocr),
+        enable_gps=bool(args.gps), gps_port=(args.gps_port or None), simulate_gps=bool(args.sim_gps),
+        enable_mav=bool(args.mav), mav_conn=(args.mav_conn or None), simulate_mav=bool(args.sim_mav),
+    )
+    det = IhaDetector(cfg)
+
+    # source parse
+    src = args.source
+    try:
+        if len(src) <= 2 and src.isdigit():
+            src = int(src)
+    except Exception:
+        pass
+
+    if args.demo:
+        det.run_demo_images(args.demo)
+    else:
+        if isinstance(src, int) or src.startswith(("rtsp://","http://","https://")):
+            det.run_camera(src, show_original=True)
+        else:
+            out = args.video_out or None
+            det.run_video(src, output=out, show_original=False)
+
+
+# ================== Main ==================
+def main():
+    # GUI/CLI otomatik: --cli verilmişse CLI, yoksa GUI
+    if len(sys.argv) > 1 and "--cli" in sys.argv:
+        run_cli()
+        return
+    if not GUI_OK:
+        print("GUI ortamı yok (customtkinter bulunamadı). CLI ile çalıştırın: --cli")
+        run_cli()
+        return
+    try:
+        app = AppGUI()
+        app.run()
+    except Exception as e:
+        print("GUI başlatılamadı:", e)
+        traceback.print_exc()
+        print("CLI ile deneyin: python iha_all_in_one_v4.py --cli")
+
+if __name__ == "__main__":
+    main()
